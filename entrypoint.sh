@@ -2,13 +2,10 @@
 
 set -euo pipefail
 
-if [ -z "$MYSQL_HOST" ] ||  [ -z "$MYSQL_PORT" ] ||[ -z "$MYSQL_USER" ] || [ -z "$MYSQL_PASSWORD" ] || [ -z "$MYSQL_DB_NAME" ] || [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ] || [ -z "$R2_BUCKET" ] || [ -z "$R2_S3_ENDPOINT" ]; then
+if [ -z "$MYSQL_HOST" ] ||  [ -z "$MYSQL_PORT" ] ||[ -z "$MYSQL_USER" ] || [ -z "$MYSQL_PASSWORD" ] || [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ] || [ -z "$R2_BUCKET" ] || [ -z "$R2_S3_ENDPOINT" ]; then
     echo "Missing required environment variables."
     exit 1
 fi
-
-# Creates MySQL dump filename
-DUMP_FILE="db_backup_$(date +%Y%m%d_%H%M%S).sql.gz"  # Define DUMP_FILE
 
 # Create MySQL config file with credentials
 MYSQL_CNF=$(mktemp)
@@ -34,17 +31,12 @@ until mysqladmin --defaults-file="$MYSQL_CNF" ping 2>/dev/null; do
     sleep 2
 done
 
-# Creates Gzip MySQL dump file
-mysqldump --defaults-file="$MYSQL_CNF" --protocol=tcp "$MYSQL_DB_NAME" | gzip > $DUMP_FILE
+# Liste toutes les DB, sauf system (mysql, information_schema, etc)
+DBS=$(mysql --defaults-file="$MYSQL_CNF" -N -e "SHOW DATABASES;" | grep -Ev "^(mysql|sys|information_schema|performance_schema)$")
 
-# Close MySQL connection
-mysqladmin --defaults-file="$MYSQL_CNF" shutdown 2>/dev/null || true
-
-# Removes temporary config file
-rm "$MYSQL_CNF"
-
-if [ $? -ne 0 ]; then
-    echo "Database dump failed."
+if [ -z "$DBS" ]; then
+    echo "No user databases found."
+    rm "$MYSQL_CNF"
     exit 1
 fi
 
@@ -66,27 +58,32 @@ EOL
 # Writes rclone.conf content
 echo "$CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
 
-# Check if the file was created successfully
-if [ -f ~/.config/rclone/rclone.conf ]; then
-    echo "rclone.conf created successfully."
-else
+if [ ! -f ~/.config/rclone/rclone.conf ]; then
     echo "Error: Failed to create rclone.conf"
+    rm "$MYSQL_CNF"
     exit 1
 fi
 
 # Creates bucket if it doesn't exist
 rclone mkdir remote:$R2_BUCKET
 
-# Copies backup file to R2
-rclone copyto $DUMP_FILE remote:$R2_BUCKET/mysql-backup/$DUMP_FILE
+# Loop sur chaque DB et backup
+for DB in $DBS; do
+    DUMP_FILE="db_${DB}_backup_$(date +%Y%m%d_%H%M%S).sql.gz"
+    echo "Dumping $DB..."
+    mysqldump --defaults-file="$MYSQL_CNF" --protocol=tcp "$DB" | gzip > "$DUMP_FILE"
+    if [ $? -ne 0 ]; then
+        echo "Dump failed for $DB"
+        continue
+    fi
+    rclone copyto "$DUMP_FILE" remote:$R2_BUCKET/mysql-backup/"$DUMP_FILE"
+    if [ $? -eq 0 ]; then
+        echo "Backup $DB ok!"
+        rm "$DUMP_FILE"
+    else
+        echo "Backup failed for $DB"
+    fi
+done
 
-# Checks rclone exit status
-if [ $? -eq 0 ]; then
-    echo "Backup file copied successfully to R2."
-    # Cleans up local backup file
-    rm $DUMP_FILE
-    exit 0
-else
-    echo "Error: Failed to copy backup file to R2."
-    exit 1
-fi
+# Removes temporary config file
+rm "$MYSQL_CNF"
